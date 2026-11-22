@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import mujoco
 import torch
 
-from .rotations import mat_to_6d, quat_to_mat, skew, so3_exp
+from .rotations import mat_to_6d, mv3, quat_to_mat, skew, so3_exp, yaw_mat
 
 if TYPE_CHECKING:
     from .dr import XiLayout
@@ -79,17 +79,18 @@ class SensingCfg:
         return self.delay_hold_prob is not None or self.imu is not None or self.joint_vel_filter is not None
 
 
-def obs_noise(cfg: SensingCfg, J: int) -> torch.Tensor:
-    return torch.cat(
-        (
-            torch.full((J,), cfg.noise_joint_pos),
-            torch.full((J,), cfg.noise_joint_vel),
-            torch.full((3,), cfg.noise_ang_vel),
-            torch.full((3,), cfg.noise_gravity),
-            torch.zeros(J),
-            torch.full((6,), cfg.noise_ref_ori),
-        )
+def obs_noise(cfg: SensingCfg, J: int, include_root_position_error: bool = False) -> torch.Tensor:
+    parts = (
+        torch.full((J,), cfg.noise_joint_pos),
+        torch.full((J,), cfg.noise_joint_vel),
+        torch.full((3,), cfg.noise_ang_vel),
+        torch.full((3,), cfg.noise_gravity),
+        torch.zeros(J),
+        torch.full((6,), cfg.noise_ref_ori),
     )
+    if include_root_position_error:
+        parts += (torch.full((3,), cfg.noise_joint_pos),)
+    return torch.cat(parts)
 
 
 def _normalize(v: torch.Tensor) -> torch.Tensor:
@@ -121,6 +122,8 @@ class ObsPipeline:
         self.J, self.obs_dim, self.device = J, mdp.obs_dim, device
         # delay group of every observation dim: q, qd, angular velocity, attitude (gravity + ref ori); -1 = exact
         group = [0] * J + [1] * J + [2] * 3 + [3] * 3 + [-1] * J + [3] * 6
+        if robot.include_root_position_error:
+            group += [3] * 3
         self.group = torch.tensor([max(g, 0) for g in group], device=device)
         self.delayed = torch.tensor([g >= 0 for g in group], device=device)
         jf = self.cfg.joint_vel_filter
@@ -225,7 +228,10 @@ class ObsPipeline:
         qd_obs = st["qd_f"] if self.cfg.joint_vel_filter is not None else qd
         g_b = -R_att[..., 2, :]
         rel = mat_to_6d(R_att.transpose(-1, -2) @ self.mdp.motion.root_R[f])
-        return torch.cat((q - self.mdp.default_q - dq0, qd_obs, ang_vel, g_b, a_prev, rel), -1)
+        parts = (q - self.mdp.default_q - dq0, qd_obs, ang_vel, g_b, a_prev, rel)
+        if self.mdp.include_root_position_error:
+            parts += (mv3(yaw_mat(R_att).transpose(-1, -2), self.mdp.motion.root_p[f] - p),)
+        return torch.cat(parts, -1)
 
     def observe(self, st: dict, raw: torch.Tensor, noise: bool, delay: bool) -> tuple[torch.Tensor, dict]:
         st = dict(st)

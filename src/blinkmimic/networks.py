@@ -211,8 +211,9 @@ class Policy(nn.Module):
     """a = dec(enc(g), o_{t-9:t}); deterministic, latent z in R^32 bounded by tanh.
 
     ``ref_skip`` = (offset, q0, alpha) (--pi_ref_skip): reference-action skip connection,
-    a = (q_ref(f+1) - q0) / alpha + dec(...), with q_ref(f+1) read from the raw (unnormalized) goal vector at
-    ``offset``; the network only learns the correction to tracking the reference with the PD controller."""
+    a = (q_ref - q0) / alpha + dec(...), with q_ref read from the raw (unnormalized) goal vector at
+    ``offset``. In released mode q_ref is the first future frame. In causal mode it is the current frame.
+    The network learns the correction to tracking the reference with the PD controller."""
 
     def __init__(self, obs_dim: int, goal_dim: int, act_dim: int, hist: int = 10, z_dim: int = 32,
                  enc_hidden=(2048, 1024, 512, 256), dec_hidden=(2048, 1024, 512, 256), ref_skip=None):  # fmt: skip

@@ -79,15 +79,16 @@ def main():
     robot = get_robot(a.robot)
     ck = torch.load(a.ckpt, map_location=dev)
     K, Hh = ck["args"]["goal_frames"], ck["args"]["hist"]
-    motion = MotionLib([a.motion], Kinematics(robot, dev), dev, robot.load_motion)
+    motion = MotionLib([a.motion], Kinematics(robot, dev), dev, robot.load_motion,
+                       causal_goal=ck["args"].get("causal_goal", False))
     networks.AMP_DTYPE = None  # fp32 graph (training ran the MLPs under bf16 autocast)
     widths = lambda key: tuple(int(x) for x in ck["args"].get(key, "2048,1024,512,256").split(","))  # noqa: E731
-    pi = Policy(obs_dim(robot.num_joints), motion.goal_dim(K), robot.num_joints, hist=Hh, enc_hidden=widths("enc_hidden"),
+    pi = Policy(obs_dim(robot.num_joints, robot.include_root_position_error), motion.goal_dim(K), robot.num_joints, hist=Hh, enc_hidden=widths("enc_hidden"),
                 dec_hidden=widths("dec_hidden"), **policy_kwargs(ck["args"], robot))  # fmt: skip
     pi.load_state_dict(ck["pi"])
     model = PolicyWithMotion(pi, motion, K).eval()
 
-    obs = torch.zeros(1, Hh, obs_dim(robot.num_joints))
+    obs = torch.zeros(1, Hh, obs_dim(robot.num_joints, robot.include_root_position_error))
     t = torch.zeros(1, 1)
     torch.onnx.export(model, (obs, t), a.out, input_names=["obs_history", "time_step"], output_names=OUTPUTS,
                       opset_version=18, dynamo=False)  # fmt: skip
@@ -104,7 +105,9 @@ def main():
         "default_joint_pos": fmt(robot.default_joint_pos_list()),
         "action_scale": fmt(robot.action_scale_list()),
         "command_names": "motion",
-        "observation_names": "joint_pos,joint_vel,base_ang_vel,projected_gravity,actions,motion_anchor_ori_b",
+        "observation_names": "joint_pos,joint_vel,base_ang_vel,projected_gravity,actions,motion_anchor_ori_b"
+                            + (",root_position_error_b" if robot.include_root_position_error else ""),
+        "causal_goal": str(bool(ck["args"].get("causal_goal", False))).lower(),
         "observation_history": str(Hh),
         "goal_frames": str(K),
         "control_dt": str(CONTROL_DT),

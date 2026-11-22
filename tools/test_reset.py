@@ -11,7 +11,8 @@ from blinkmimic.robot import get_robot
 dev = "cuda:0"
 robot = get_robot(args.robot)
 kin = Kinematics(robot, dev); motion = MotionLib.from_dir(robot.motion_dir, robot, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
+          include_root_position_error=robot.include_root_position_error)
 env = TrackingSim(make_sim(robot), 64, robot, motion, mdp, dev, eval_mode=True)
 ids = torch.arange(64, device=dev)
 for _ in range(30):

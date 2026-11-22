@@ -27,6 +27,7 @@ parser.add_argument("--watch", action="store_true")
 parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
+parser.add_argument("--object_mjcf", type=str, default=None, help="optional fixed-base reference object MJCF")
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 parser.add_argument("--dr_from", type=str, default=None, help="evaluate under this robot's training randomization ('self': own)")
 parser.add_argument("--dr_parts", type=str, default="all", choices=["all", "dynamics", "sensing"],
@@ -83,7 +84,8 @@ if args.dr_from:
     print("pd_gain_scale on this robot:", robot.dr.pd_gain_scale)
 kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
+          include_root_position_error=robot.include_root_position_error)
 C = len(motion.names)
 N = C * args.repeats
 clip_of = torch.arange(N, device=dev) % C
@@ -92,6 +94,7 @@ clip_of = torch.arange(N, device=dev) % C
 @torch.no_grad()
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
+    motion.set_causal_goal(a_.get("causal_goal", False))
     K, Hh = a_["goal_frames"], a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
     widths = lambda key, default: tuple(int(x) for x in a_.get(key, default).split(","))  # noqa: E731
@@ -144,7 +147,8 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
 
 sim_cfg = make_sim(robot)
-env = TrackingSim(sim_cfg, N, robot, motion, mdp, dev, eval_mode=True, randomize=args.dr_from is not None)
+env = TrackingSim(sim_cfg, N, robot, motion, mdp, dev, eval_mode=True, randomize=args.dr_from is not None,
+                  object_mjcf=args.object_mjcf)
 if args.ckpt:
     ck = torch.load(args.ckpt, map_location=dev)
     res = evaluate(env, ck, args.record)

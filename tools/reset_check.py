@@ -21,7 +21,8 @@ torch.manual_seed(0)
 robot = get_robot("g1")
 kin = Kinematics(robot, dev)
 motion = MotionLib.from_dir(robot.motion_dir, robot, kin, dev)
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
+          include_root_position_error=robot.include_root_position_error)
 N = 512
 env = TrackingSim(make_sim(robot), N, robot, motion, mdp, dev, fail_reset=0.3, bin_fix=True, reset_noise=False)
 for _ in range(30):

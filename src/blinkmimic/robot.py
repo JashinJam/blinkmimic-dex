@@ -46,6 +46,8 @@ class RobotSpec:
     """Simulator randomization (default: the paper's G1 setup)."""
     sensing: SensingCfg = field(default_factory=SensingCfg)
     """How the policy observation is sensed (default: true state plus Table A.1 noise)."""
+    include_root_position_error: bool = False
+    """Append the current reference root position error to the deployable observation."""
     njmax: int = 500
     nconmax: int = 128
     """MuJoCo-Warp constraint / contact capacity per world."""

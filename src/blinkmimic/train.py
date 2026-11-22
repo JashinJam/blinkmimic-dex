@@ -20,6 +20,8 @@ parser.add_argument("--buffer_steps", type=int, default=1000)
 parser.add_argument("--utd", type=float, default=0.4, help="updates per vectorized simulator step")
 parser.add_argument("--horizon", type=int, default=32)
 parser.add_argument("--goal_frames", type=int, default=10)
+parser.add_argument("--causal_goal", action="store_true",
+                    help="use only the current reference frame and backward differences in policy goals")
 parser.add_argument("--hist", type=int, default=10)
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
@@ -125,6 +127,12 @@ parser.add_argument("--ckpt_minutes", type=float, default=3.0, help="also checkp
 parser.add_argument("--max_hours", type=float, default=None, help="stop after this much training wall-clock")
 parser.add_argument("--log_every", type=int, default=50)
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
+parser.add_argument("--object_mjcf", type=str, default=None,
+                    help="fixed-base mocap object MJCF for the reference scene (requires object metadata in NPZ motions)")
+parser.add_argument("--object_rel_reward", type=float, default=0.0,
+                    help="dense hand-object relative-position reward weight used only during training")
+parser.add_argument("--object_rel_std", type=float, default=0.05,
+                    help="standard deviation in metres for the hand-object relative-position reward")
 parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "run"))
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
@@ -138,7 +146,7 @@ from blinkmimic.buffer import ReplayBuffer
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import PHYSICS_DT, TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
-from blinkmimic.mdp import MDP, inv_dim, unflatten_state
+from blinkmimic.mdp import MDP, RewardCfg, inv_dim, unflatten_state
 from blinkmimic.motion import CONTROL_DT, MotionLib
 import blinkmimic.networks as networks
 import blinkmimic.rotations as rotations
@@ -160,10 +168,12 @@ json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent
 robot = get_robot(args.robot)
 J = robot.num_joints
 kin = Kinematics(robot, dev)
-motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
+motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev, causal_goal=args.causal_goal)
 layout = XiLayout(robot, dev)
 normalize_xi = layout.normalize
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing)
+reward_cfg = RewardCfg(w_object_rel=args.object_rel_reward, object_rel_std=args.object_rel_std)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), layout.dim, robot.sensing,
+          cfg=reward_cfg, include_root_position_error=robot.include_root_position_error)
 pipe = ObsPipeline(robot, mdp, layout, dev, PHYSICS_DT)
 K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = motion.goal_dim(K)
@@ -533,7 +543,10 @@ if args.compile_more:
     # the simulator wrapper calls these once per control step in eager mode otherwise (FK + rotations: thousands of kernels)
     mdp.reward, mdp.termination, mdp.obs = torch.compile(mdp.reward), torch.compile(mdp.termination), torch.compile(mdp.obs)
     motion.goal = torch.compile(motion.goal)
-env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset, bin_fix=args.bin_fix)
+if args.object_mjcf and (args.collect_graph or args.reset_masked):
+    raise ValueError("--object_mjcf currently requires eager collection and eager resets")
+env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset,
+                  bin_fix=args.bin_fix, object_mjcf=args.object_mjcf)
 if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics (episodes already running keep their start)
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
@@ -687,7 +700,8 @@ if EPROBE:
     assert not args.eprobe_async or args.eprobe_graph, "--eprobe_async needs --eprobe_graph"
     EP_PI = copy.deepcopy(pi_avg.module) if args.eprobe_async else pi_avg.module  # sweep policy (async: a snapshot)
     EP_SIDE, EP_ASYNC, ITER_NOW = (torch.cuda.Stream() if args.eprobe_async else None), {}, [0]
-    penv = TrackingSim(make_sim(robot), P_EP, robot, motion, mdp, dev, eval_mode=True, randomize=False, reset_noise=False)
+    penv = TrackingSim(make_sim(robot), P_EP, robot, motion, mdp, dev, eval_mode=True, randomize=False, reset_noise=False,
+                       object_mjcf=args.object_mjcf)
     EP_FAIL = torch.zeros(motion.num_bins, device=dev)  # decayed counts of first failures per bin
     # bin b -> the next bin of the same clip (or itself at the clip end): walking it --eprobe_win times spreads a failure
     # weight back over the window before it

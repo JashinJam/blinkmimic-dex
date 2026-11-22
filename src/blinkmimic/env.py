@@ -9,9 +9,11 @@ reference-motion states drawn by return-based bin sampling (SuperMimic paper App
 from __future__ import annotations
 
 import torch
+import mujoco
 import mujoco_warp as mjwarp
 import warp as wp
 from mjlab.entity.data import EntityData
+from mjlab.entity import EntityCfg
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
@@ -59,12 +61,22 @@ DECIMATION = 4  # 4 physics substeps of 5 ms per 50 Hz control step
 PHYSICS_DT = CONTROL_DT / DECIMATION
 
 
-def make_scene_cfg(robot: RobotSpec, num_envs: int) -> SceneCfg:
+def _object_cfg(path: str) -> EntityCfg:
+    return EntityCfg(
+        init_state=EntityCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}),
+        spec_fn=lambda path=path: mujoco.MjSpec.from_file(path),
+    )
+
+
+def make_scene_cfg(robot: RobotSpec, num_envs: int, object_mjcf: str | None = None) -> SceneCfg:
+    entities = {"robot": robot.robot_cfg()}
+    if object_mjcf is not None:
+        entities["object"] = _object_cfg(object_mjcf)
     return SceneCfg(
         num_envs=num_envs,
         env_spacing=0.0,
         terrain=TerrainEntityCfg(terrain_type="plane"),
-        entities={"robot": robot.robot_cfg()},
+        entities=entities,
     )
 
 
@@ -105,15 +117,21 @@ class TrackingSim:
 
     def __init__(self, sim_cfg: SimulationCfg, num_envs: int, robot: RobotSpec, motion: MotionLib, mdp: MDP,
                  device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int = 500,
-                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False):  # fmt: skip
+                 reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False,
+                 object_mjcf: str | None = None):  # fmt: skip
         """``randomize`` (default: not eval_mode) switches domain randomization, observation noise and
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
         exactly on the reference)."""
         self.device = device
-        self.scene = Scene(make_scene_cfg(robot, num_envs), device=device)
+        self.scene = Scene(make_scene_cfg(robot, num_envs, object_mjcf), device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
         self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
         self.robot = self.scene["robot"]
+        self.object = self.scene["object"] if object_mjcf is not None else None
+        if self.object is not None and not self.object.is_mocap:
+            raise ValueError("the reference object MJCF must be fixed-base so mjlab can drive its mocap pose")
+        if self.object is not None and motion.object_p is None:
+            raise ValueError("object_mjcf requires motion files with object_pos/object_quat_wxyz")
         assert list(self.robot.joint_names) == list(robot.joint_names), self.robot.joint_names
         self.N = num_envs
         self.J = robot.num_joints
@@ -172,6 +190,13 @@ class TrackingSim:
         self.done_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.failed_eval = torch.zeros(self.N, dtype=torch.bool, device=dev)
         self.reset(torch.arange(self.N, device=dev))
+
+    def _write_object_pose(self, frames: torch.Tensor, env_ids: torch.Tensor) -> None:
+        if self.object is None:
+            return
+        pose = torch.cat((self.motion.object_p[frames] + self.scene.env_origins[env_ids],
+                          mat_to_quat(self.motion.object_R[frames])), -1)
+        self.object.write_mocap_pose(pose, env_ids=env_ids)
 
     @property
     def num_envs(self) -> int:
@@ -245,6 +270,7 @@ class TrackingSim:
         self.robot.write_joint_position_to_sim(q, env_ids=env_ids)
         self.robot.write_joint_velocity_to_sim(qd, env_ids=env_ids)
         self.robot.set_joint_position_target(q, env_ids=env_ids)
+        self._write_object_pose(frames, env_ids)
         self.f[env_ids] = frames
         self.ep_step.index_fill_(0, env_ids, 0)  # index_fill_: no host sync (see _dev_scalar)
         self.a_prev.index_fill_(0, env_ids, 0.0)
@@ -323,6 +349,8 @@ class TrackingSim:
         self.ep_disc_ret.masked_fill_(d, 0.0)
         self.ep_ret.masked_fill_(d, 0.0)
         self.randomizer.reset_masked(self.xi, d)
+        ids = d.nonzero(as_tuple=False).squeeze(-1)
+        self._write_object_pose(frames[ids], ids)
         self.obs_fresh |= d
 
     def step_tail_masked(self, out: dict) -> dict:
@@ -424,6 +452,8 @@ class TrackingSim:
                                                           PHYSICS_DT, noise=self.randomize)  # fmt: skip
         S1 = self.state()
         f1 = f + 1
+        if self.object is not None:
+            self._write_object_pose(f1, torch.arange(self.N, device=self.device))
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
         term = self.mdp.termination(S1, f1)
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]

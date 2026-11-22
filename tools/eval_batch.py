@@ -20,6 +20,7 @@ parser.add_argument("--group", type=int, default=13, help="checkpoints evaluated
 parser.add_argument("--reps", type=int, default=1,
                     help="independent replicas of every clip per checkpoint (the simulator is not bitwise "
                          "reproducible, so borderline clips can flip); results are averaged and written to eval_r<reps>.csv")
+parser.add_argument("--object_mjcf", type=str, default=None, help="optional fixed-base reference object MJCF")
 args = parser.parse_args()
 
 import torch
@@ -38,9 +39,11 @@ dev = "cuda:0"
 robot = get_robot(args.robot)
 kin = Kinematics(robot, dev)
 _run_args = json.load(open(os.path.join(args.run_dir, "args.json"))) if os.path.exists(os.path.join(args.run_dir, "args.json")) else {}
-motion = MotionLib.from_dir(_run_args.get("motion_dir") or robot.motion_dir, robot, kin, dev)  # the run's own motion set
+motion = MotionLib.from_dir(_run_args.get("motion_dir") or robot.motion_dir, robot, kin, dev,
+                            causal_goal=_run_args.get("causal_goal", False))  # the run's own motion set
 check_pruned(_run_args, nets_only=True, what=args.run_dir)
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
+          include_root_position_error=robot.include_root_position_error)
 C = len(motion.names)
 
 
@@ -61,6 +64,8 @@ def evaluate_group(env: TrackingSim, cks: list[dict]) -> list[dict]:
     a0 = cks[0]["args"]
     K, Hh = a0["goal_frames"], a0["hist"]
     assert all(ck["args"]["goal_frames"] == K and ck["args"]["hist"] == Hh for ck in cks)
+    assert all(ck["args"].get("causal_goal", False) == a0.get("causal_goal", False) for ck in cks)
+    motion.set_causal_goal(a0.get("causal_goal", False))
     networks.AMP_DTYPE = torch.bfloat16 if a0.get("amp", "none") == "bf16" else None
     clip_of = torch.arange(N, device=dev) % C
     env.done_eval[:] = False
@@ -134,7 +139,8 @@ for s in range(0, len(todo), args.group):
     paths = todo[s : s + args.group]
     cks = [torch.load(p, map_location="cpu", weights_only=False) for p in paths]  # full checkpoints also hold the world model: keep them off the GPU
     if env is None or env.N != C * len(paths) * args.reps:
-        env = TrackingSim(make_sim(robot), C * len(paths) * args.reps, robot, motion, mdp, dev, eval_mode=True, randomize=False)
+        env = TrackingSim(make_sim(robot), C * len(paths) * args.reps, robot, motion, mdp, dev, eval_mode=True,
+                          randomize=False, object_mjcf=args.object_mjcf)
     t0 = time.time()
     for p, ck, res in zip(paths, cks, merge_reps(evaluate_group(env, [c for c in cks for _ in range(args.reps)]))):
         it = int(os.path.basename(p)[5:11])

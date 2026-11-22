@@ -21,14 +21,27 @@ GOAL_Q_OFFSET = 15  # index of the joint positions q(f+1) in the goal vector (fi
 
 
 class MotionLib:
-    def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays]):
+    def __init__(self, files: list[str], kin: Kinematics, device: str, load_motion: Callable[[str], MotionArrays],
+                 causal_goal: bool = False):
         self.device = device
         self.names = [os.path.splitext(os.path.basename(f))[0] for f in files]
         ps, qs, js = [], [], []
+        object_ps, object_qs = [], []
+        object_mode: bool | None = None
         lens = []
         for f in files:
             p, quat, j, src_fps = load_motion(f)
             p, quat, j = (torch.tensor(x, dtype=torch.float32) for x in (p, quat, j))
+            object_p, object_q = _load_object_fields(f)
+            if object_mode is None:
+                object_mode = object_p is not None
+            elif object_mode != (object_p is not None):
+                raise ValueError(f"mixed object metadata in motion set: {f}")
+            if object_p is not None:
+                object_p = torch.tensor(object_p, dtype=torch.float32)
+                object_q = torch.tensor(object_q, dtype=torch.float32)
+                if object_p.shape != (p.shape[0], 3) or object_q.shape != (p.shape[0], 4):
+                    raise ValueError(f"{f}: object_pos/object_quat_wxyz must match motion length")
             # resample to 50 Hz
             T_src = p.shape[0]
             dur = (T_src - 1) / src_fps
@@ -39,7 +52,12 @@ class MotionLib:
             p = p[i0] * (1 - a[:, None]) + p[i0 + 1] * a[:, None]
             j = j[i0] * (1 - a[:, None]) + j[i0 + 1] * a[:, None]
             quat = quat_slerp(quat[i0], quat[i0 + 1], a)
+            if object_p is not None:
+                object_p = object_p[i0] * (1 - a[:, None]) + object_p[i0 + 1] * a[:, None]
+                object_q = quat_slerp(object_q[i0], object_q[i0 + 1], a)
             ps.append(p), qs.append(quat), js.append(j)
+            if object_p is not None:
+                object_ps.append(object_p), object_qs.append(object_q)
             lens.append(n)
         self.clip_len = torch.tensor(lens, device=device)
         self.clip_start = torch.cumsum(torch.cat((torch.zeros(1, dtype=torch.long), torch.tensor(lens[:-1], dtype=torch.long))), 0).to(device)  # dtype: one clip gives an empty (float) tensor
@@ -48,6 +66,7 @@ class MotionLib:
         self.clip_id = torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(lens)]).to(device)
 
         root_p, root_R, root_v, root_w, jq, jqd = [], [], [], [], [], []
+        goal_v, goal_w, goal_qd = [], [], []
         for p, quat, j in zip(ps, qs, js):
             R = quat_to_mat(quat)
             v = _gradient(p, CONTROL_DT)
@@ -57,10 +76,22 @@ class MotionLib:
             w[1:-1] = so3_log(R[2:] @ R[:-2].transpose(-1, -2)) / (2 * CONTROL_DT)
             w[0] = so3_log(R[1] @ R[0].T) / CONTROL_DT
             w[-1] = so3_log(R[-1] @ R[-2].T) / CONTROL_DT
+            v_causal = _backward_gradient(p, CONTROL_DT)
+            qd_causal = _backward_gradient(j, CONTROL_DT)
+            w_causal = torch.zeros_like(p)
+            w_causal[1:] = so3_log(R[1:] @ R[:-1].transpose(-1, -2)) / CONTROL_DT
             root_p.append(p), root_R.append(R), root_v.append(v), root_w.append(w), jq.append(j), jqd.append(qd)
+            goal_v.append(v_causal), goal_w.append(w_causal), goal_qd.append(qd_causal)
         cat = lambda xs: torch.cat(xs).to(device)  # noqa: E731
         self.root_p, self.root_R, self.root_v, self.root_w = cat(root_p), cat(root_R), cat(root_v), cat(root_w)
         self.q, self.qd = cat(jq), cat(jqd)
+        self.goal_root_v, self.goal_root_w, self.goal_qd = cat(goal_v), cat(goal_w), cat(goal_qd)
+        self.causal_goal = bool(causal_goal)
+        if object_mode:
+            self.object_p = cat(object_ps)
+            self.object_R = quat_to_mat(cat(object_qs))
+        else:
+            self.object_p = self.object_R = None
         with torch.no_grad():
             bp, bR, bv, bw = [], [], [], []
             for s in range(0, self.num_frames, 65536):
@@ -72,6 +103,8 @@ class MotionLib:
         Rt = self.root_R.transpose(-1, -2)
         self.root_v_local = (Rt @ self.root_v.unsqueeze(-1)).squeeze(-1)
         self.root_w_local = (Rt @ self.root_w.unsqueeze(-1)).squeeze(-1)
+        self.goal_root_v_local = (Rt @ self.goal_root_v.unsqueeze(-1)).squeeze(-1)
+        self.goal_root_w_local = (Rt @ self.goal_root_w.unsqueeze(-1)).squeeze(-1)
         self.root_gz = self.root_R[:, 2, 2]  # -(projected gravity z) of the reference root: g_b = R^T (0,0,-1)
         # 1 s bins
         bin_clip, bin_start = [], []
@@ -91,9 +124,13 @@ class MotionLib:
             self.frame_bin[s:e] = b
 
     @staticmethod
-    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str) -> MotionLib:
+    def from_dir(path: str, robot: RobotSpec, kin: Kinematics, device: str, causal_goal: bool = False) -> MotionLib:
         files = sorted(glob.glob(os.path.join(path, robot.motion_glob)))
-        return MotionLib(files, kin, device, robot.load_motion)
+        return MotionLib(files, kin, device, robot.load_motion, causal_goal=causal_goal)
+
+    def set_causal_goal(self, enabled: bool) -> None:
+        """Select whether policy goals use only the current frame and backward differences."""
+        self.causal_goal = bool(enabled)
 
     def set_ref_contact(self, feet: list[int], margin: float = 0.015, vmax: float = 0.5, q: float = 0.05) -> None:
         """Speed-branch reference foot contact (num_frames, len(feet)): height below the clip's own floor (the
@@ -117,15 +154,23 @@ class MotionLib:
         return torch.minimum(fut, end.unsqueeze(-1))
 
     def goal(self, f: torch.Tensor, K: int) -> torch.Tensor:
-        """Goal features from the reference only: K future frames relative to the current reference frame."""
-        fut = self.future_frames(f, K)  # (B,K)
+        """Goal features from the reference.
+
+        The released recipe uses K future frames and central-difference velocities.  Causal mode repeats
+        the current frame K times and uses backward differences, so the policy receives no future reference
+        frame or derivative computed from one.
+        """
+        if self.causal_goal:
+            fut = f.unsqueeze(-1).expand(-1, K)
+            goal_v_local, goal_w_local, goal_qd = self.goal_root_v_local, self.goal_root_w_local, self.goal_qd
+        else:
+            fut = self.future_frames(f, K)
+            goal_v_local, goal_w_local, goal_qd = self.root_v_local, self.root_w_local, self.qd
         H = yaw_mat(self.root_R[f])  # (B,3,3)
         Ht = H.transpose(-1, -2).unsqueeze(1)
         dp = mv3(Ht, self.root_p[fut] - self.root_p[f].unsqueeze(1))
         rot = mat_to_6d(mm3(Ht, self.root_R[fut]))
-        feats = torch.cat(
-            (dp, rot, self.root_v_local[fut], self.root_w_local[fut], self.q[fut], self.qd[fut] * 0.1), -1
-        )  # (B,K,15+2J)
+        feats = torch.cat((dp, rot, goal_v_local[fut], goal_w_local[fut], self.q[fut], goal_qd[fut] * 0.1), -1)
         return feats.reshape(f.shape[0], -1)
 
     def ref_state(self, f: torch.Tensor):
@@ -138,3 +183,28 @@ def _gradient(x: torch.Tensor, dt: float) -> torch.Tensor:
     g[0] = (x[1] - x[0]) / dt
     g[-1] = (x[-1] - x[-2]) / dt
     return g
+
+
+def _backward_gradient(x: torch.Tensor, dt: float) -> torch.Tensor:
+    """One-sided derivative using only the current and previous resampled frame."""
+    g = torch.zeros_like(x)
+    g[1:] = (x[1:] - x[:-1]) / dt
+    return g
+
+
+def _load_object_fields(path: str) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Read optional kinematic object metadata without changing the G1 CSV loader contract."""
+    if not str(path).endswith(".npz"):
+        return None, None
+    with np.load(path, allow_pickle=False) as data:
+        if "object_pos" not in data and "object_quat_wxyz" not in data:
+            return None, None
+        required = ("object_pos", "object_quat_wxyz")
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise ValueError(f"{path}: incomplete object metadata, missing {missing}")
+        p = np.asarray(data["object_pos"], dtype=np.float32)
+        q = np.asarray(data["object_quat_wxyz"], dtype=np.float32)
+        if not np.isfinite(np.concatenate((p, q), axis=-1)).all():
+            raise ValueError(f"{path}: non-finite object metadata")
+        return p, q

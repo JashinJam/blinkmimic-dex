@@ -49,8 +49,10 @@ def main():
     robot = get_robot(a.robot)
     assert ",".join(robot.joint_names) == meta["joint_names"]
     kin = Kinematics(robot, dev)
-    motion = MotionLib([a.motion], kin, dev, robot.load_motion)
-    mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+    motion = MotionLib([a.motion], kin, dev, robot.load_motion,
+                       causal_goal=meta.get("causal_goal", "false") == "true")
+    mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
+              include_root_position_error=robot.include_root_position_error)
     env = TrackingSim(make_sim(robot), 1, robot, motion, mdp, dev, eval_mode=True)
     env.done_eval[:] = False
     env.failed_eval[:] = False
@@ -67,7 +69,14 @@ def main():
             # sensors: joint encoders, root attitude and gyro (root frame)
             _, R, _, w, q, qd = (x[0].cpu().numpy() for x in env.state())
             R_rel = R.T @ quat_to_mat(ref_quat)
-            o = np.concatenate((q - q0, qd, R.T @ w, -R[2], a_prev, R_rel[:, :2].reshape(6))).astype(np.float32)
+            parts = [q - q0, qd, R.T @ w, -R[2], a_prev, R_rel[:, :2].reshape(6)]
+            if robot.include_root_position_error:
+                root_ref = motion.root_p[env.f[0]].cpu().numpy()
+                fx, fy = R[0, 0], R[1, 0]
+                n = np.sqrt(fx * fx + fy * fy + 1e-9)
+                yaw = np.array([[fx / n, fy / n, 0.0], [-fy / n, fx / n, 0.0], [0.0, 0.0, 1.0]])
+                parts.append(yaw.T @ (root_ref - env.state()[0][0].cpu().numpy()))
+            o = np.concatenate(parts).astype(np.float32)
             obs_err = max(obs_err, float(np.abs(o - sim_o).max()))
         hist = np.repeat(o[None], H, 0) if hist is None else np.concatenate((hist[1:], o[None]))
         out = dict(zip([x.name for x in sess.get_outputs()],

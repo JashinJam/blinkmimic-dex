@@ -25,7 +25,8 @@ kin = Kinematics(robot, dev)
 t0 = time.time()
 motion = MotionLib.from_dir(args.motion_dir or robot.motion_dir, robot, kin, dev)
 print(f"motion: {len(motion.names)} clips, {motion.num_frames} frames ({motion.num_frames * 0.02 / 3600:.2f} h), bins {motion.num_bins}, load {time.time() - t0:.1f}s")
-mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing)
+mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
+          include_root_position_error=robot.include_root_position_error)
 env = TrackingSim(make_sim(robot), args.num_envs, robot, motion, mdp, dev, eval_mode=True)
 frames = motion.clip_start[torch.arange(args.num_envs, device=dev) % len(motion.names)] + 100
 env.reset(torch.arange(args.num_envs, device=dev), frames)

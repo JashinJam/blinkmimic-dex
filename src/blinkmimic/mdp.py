@@ -20,15 +20,16 @@ def state_dim(J: int) -> int:
     return 3 + 4 + 3 + 3 + J + J
 
 
-def obs_dim(J: int) -> int:
-    return J + J + 3 + 3 + J + 6
+def obs_dim(J: int, include_root_position_error: bool = False) -> int:
+    return J + J + 3 + 3 + J + 6 + (3 if include_root_position_error else 0)
 
 
-def obs_scale(J: int) -> torch.Tensor:
+def obs_scale(J: int, include_root_position_error: bool = False) -> torch.Tensor:
     # normalization of the obs before the policy (qd and angular velocity are large)
-    return torch.cat(
-        (torch.ones(J), torch.full((J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(J), torch.ones(6))
-    )
+    parts = (torch.ones(J), torch.full((J,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(J), torch.ones(6))
+    if include_root_position_error:
+        parts += (torch.ones(3),)
+    return torch.cat(parts)
 
 
 CONTACT_Z = 0.045  # ankle-roll link origin height below which a foot counts as in contact (as in tools/eval_metrics.py)
@@ -45,6 +46,8 @@ class RewardCfg:
     root_ori_std: float = 0.4
     w_action_rate: float = -0.1
     w_joint_limit: float = -2.0
+    w_object_rel: float = 0.0
+    object_rel_std: float = 0.05
     soft_limit_factor: float = 0.9
     term_height: float = 0.25
     term_tilt: float = 0.8
@@ -85,7 +88,8 @@ def inv_dim(J: int) -> int:
 
 class MDP:
     def __init__(self, kin: Kinematics, motion: MotionLib, default_q: torch.Tensor, xi_dim: int,
-                 sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg()):  # fmt: skip
+                 sensing: SensingCfg = SensingCfg(), cfg: RewardCfg = RewardCfg(),
+                 include_root_position_error: bool = False):  # fmt: skip
         self.kin, self.motion, self.cfg = kin, motion, cfg
         self.default_q = default_q
         mid, half = (kin.q_lo + kin.q_hi) / 2, (kin.q_hi - kin.q_lo) / 2
@@ -93,10 +97,11 @@ class MDP:
         dev = default_q.device
         J = default_q.shape[0]
         self.num_j = J
-        self.obs_dim, self.xi_dim = obs_dim(J), xi_dim
+        self.include_root_position_error = include_root_position_error
+        self.obs_dim, self.xi_dim = obs_dim(J, include_root_position_error), xi_dim
         self.critic_extra = J + len(kin.tracked_idx) * 3 + 3 + 6 + self.xi_dim
-        self.obs_noise = obs_noise(sensing, J).to(dev)
-        self.obs_scale = obs_scale(J).to(dev)
+        self.obs_noise = obs_noise(sensing, J, include_root_position_error).to(dev)
+        self.obs_scale = obs_scale(J, include_root_position_error).to(dev)
         # InstantTrack contact reward (training only): tracked-body indices of the feet, set by the trainer
         self.feet: list[int] = []
 
@@ -108,7 +113,10 @@ class MDP:
         dq0 = xi[..., 1 : 1 + q.shape[-1]]
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
         rel = mat_to_6d(mm3(Rt, self.motion.root_R[f]))
-        return torch.cat((q - self.default_q - dq0, qd, mv3(Rt, w), g_b, a_prev, rel), -1)
+        parts = (q - self.default_q - dq0, qd, mv3(Rt, w), g_b, a_prev, rel)
+        if self.include_root_position_error:
+            parts += (mv3(yaw_mat(R).transpose(-1, -2), self.motion.root_p[f] - p),)
+        return torch.cat(parts, -1)
 
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
@@ -146,6 +154,15 @@ class MDP:
         r_rate = ((a - a_prev) ** 2).sum(-1)
         r_lim = (torch.relu(q - self.soft_hi) + torch.relu(self.soft_lo - q)).sum(-1)
         r = (r_track + c.w_action_rate * r_rate + c.w_joint_limit * r_lim) * CONTROL_DT
+        if c.w_object_rel:
+            if m.object_p is None:
+                raise ValueError("object-relative reward requires motion files with object_pos/object_quat_wxyz")
+            obj_p = m.object_p[f]
+            rel = bp[..., 1:, :] - obj_p.unsqueeze(-2)
+            rel_ref = m.body_p[f][..., 1:, :] - obj_p.unsqueeze(-2)
+            e_obj = ((rel - rel_ref) ** 2).sum(-1).mean(-1)
+            r_object = torch.exp(-e_obj / c.object_rel_std**2)
+            r = r + c.w_object_rel * r_object * CONTROL_DT
         if w_contact > 0:
             fz, rz = bp[..., self.feet, 2], m.body_p[f][..., self.feet, 2]
             c_sim = torch.sigmoid((CONTACT_Z - fz) / 0.005)
@@ -155,7 +172,7 @@ class MDP:
             r_contact = (1 - (c_sim - c_ref) ** 2) + c_ref * torch.exp(-slip / 0.3**2)
             r = r + w_contact * r_contact.mean(-1) * CONTROL_DT
         if terms:
-            return r, {
+            out = {
                 "track": r_track * CONTROL_DT,
                 "e_body_pos": e_pos,
                 "e_body_ori": e_ori,
@@ -163,6 +180,9 @@ class MDP:
                 "action_rate": r_rate,
                 "joint_limit": r_lim,
             }
+            if c.w_object_rel:
+                out["object_rel"] = e_obj
+            return r, out
         return r
 
     def termination(self, S, f) -> torch.Tensor:
