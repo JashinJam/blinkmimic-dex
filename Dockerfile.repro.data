@@ -1,5 +1,5 @@
 # Bundle only the already-validated motion and robot data for temporary remote runs.
 # Build with the data directory as context so the repository .dockerignore cannot
 # accidentally omit the data layer.
-FROM blinkmimic:official-d264658-cu128-wandb
+FROM blinkmimic:official-d264658-cu128-wandb-pydev
 COPY . /workspace/blinkmimic/data
