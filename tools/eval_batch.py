@@ -16,6 +16,8 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("--run_dir", type=str, required=True)
 parser.add_argument("--robot", type=str, default="g1")
+parser.add_argument("--motion_dir", type=str, default=None,
+                    help="motion directory override, for example the holdout split")
 parser.add_argument("--group", type=int, default=13, help="checkpoints evaluated together")
 parser.add_argument("--reps", type=int, default=1,
                     help="independent replicas of every clip per checkpoint (the simulator is not bitwise "
@@ -39,7 +41,7 @@ dev = "cuda:0"
 robot = get_robot(args.robot)
 kin = Kinematics(robot, dev)
 _run_args = json.load(open(os.path.join(args.run_dir, "args.json"))) if os.path.exists(os.path.join(args.run_dir, "args.json")) else {}
-motion = MotionLib.from_dir(_run_args.get("motion_dir") or robot.motion_dir, robot, kin, dev,
+motion = MotionLib.from_dir(args.motion_dir or _run_args.get("motion_dir") or robot.motion_dir, robot, kin, dev,
                             causal_goal=_run_args.get("causal_goal", False))  # the run's own motion set
 check_pruned(_run_args, nets_only=True, what=args.run_dir)
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
