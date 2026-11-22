@@ -36,13 +36,20 @@ mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev),
           cfg=reward_cfg, include_root_position_error=robot.include_root_position_error)
 env = TrackingSim(make_sim(robot), args.num_envs, robot, motion, mdp, dev, eval_mode=True,
                   object_mjcf=args.object_mjcf)
+frames = motion.clip_start[torch.arange(args.num_envs, device=dev) % len(motion.names)] + 100
 if args.object_mjcf:
     if motion.object_p is None:
         raise ValueError("--object_mjcf requires motion files with object_pos/object_quat_wxyz")
+    mocap_id = env.object.indexing.mocap_id
+    if mocap_id is None:
+        raise ValueError("--object_mjcf did not create a mocap entity")
     print(f"object: mocap={env.object.is_mocap} fixed_base={env.object.is_fixed_base} path={args.object_mjcf}")
-frames = motion.clip_start[torch.arange(args.num_envs, device=dev) % len(motion.names)] + 100
 env.reset(torch.arange(args.num_envs, device=dev), frames)
 env.refresh()
+if args.object_mjcf:
+    object_pos = env.sim.data.mocap_pos[:, mocap_id] - env.scene.env_origins
+    object_pos_error = (object_pos - motion.object_p[frames]).abs().max().item()
+    print(f"object reset position max error: {object_pos_error:.3e} m")
 S = env.state()
 ref = motion.ref_state(frames)
 names = ["p", "R", "v", "w", "q", "qd"]
