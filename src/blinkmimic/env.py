@@ -469,14 +469,13 @@ class TrackingSim:
             self.observe()
         o, o_state = self._obs, self._obs_state
         self._obs = None
-        S = self.state()
         f = self.f.clone()
+        if self.spec.kinematic_root:
+            self._write_reference_root(f)
+        S = self.state()
         xi = self.xi.clone()
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
-        if self.spec.kinematic_root:
-            self._write_reference_root(f)
-            self.sim.forward()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
         self.robot.set_joint_position_target(target)
         clip_end = self.motion.clip_end[self.motion.clip_id[f]]
