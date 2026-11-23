@@ -48,6 +48,14 @@ class RobotSpec:
     """How the policy observation is sensed (default: true state plus Table A.1 noise)."""
     include_root_position_error: bool = False
     """Append the current reference root position error to the deployable observation."""
+    kinematic_root: bool = False
+    """Drive the free root from the reference pose at every physics substep.
+
+    This is used for a standalone hand whose wrist is supplied by an external
+    controller.  The root remains a free joint in the MJCF so the same asset
+    can still be inspected and simulated dynamically, while the tracking
+    environment treats the wrist pose as an externally commanded input.
+    """
     njmax: int = 500
     nconmax: int = 128
     """MuJoCo-Warp constraint / contact capacity per world."""

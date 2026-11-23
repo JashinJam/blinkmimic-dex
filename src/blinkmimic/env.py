@@ -23,7 +23,7 @@ from .dr import DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
 from .motion import CONTROL_DT, MotionLib
 from .robot import RobotSpec
-from .rotations import mat_to_quat, quat_to_mat, so3_exp
+from .rotations import mat_to_quat, quat_slerp, quat_to_mat, so3_exp
 from .sensing import ObsPipeline
 
 
@@ -197,6 +197,40 @@ class TrackingSim:
         pose = torch.cat((self.motion.object_p[frames] + self.scene.env_origins[env_ids],
                           mat_to_quat(self.motion.object_R[frames])), -1)
         self.object.write_mocap_pose_to_sim(pose, env_ids=env_ids)
+
+    def _write_reference_root(self, frames: torch.Tensor, env_ids: torch.Tensor | None = None,
+                              next_frames: torch.Tensor | None = None, fraction: torch.Tensor | None = None) -> None:
+        """Apply the externally commanded wrist pose for the selected worlds.
+
+        Sharpa is a standalone hand in this stage, so its free root represents
+        the wrist supplied by the human/reference stream.  Writing the pose and
+        velocity at each physics substep prevents finger actuator forces from
+        moving that externally controlled wrist.  ``next_frames`` and
+        ``fraction`` linearly advance position and velocity and slerp the root
+        orientation between two 50 Hz reference frames.
+        """
+        if not self.spec.kinematic_root:
+            return
+        p = self.motion.root_p[frames]
+        R = self.motion.root_R[frames]
+        v = self.motion.root_v[frames]
+        w = self.motion.root_w[frames]
+        if next_frames is not None:
+            if fraction is None:
+                raise ValueError("fraction is required when next_frames is provided")
+            p_next = self.motion.root_p[next_frames]
+            R_next = self.motion.root_R[next_frames]
+            v_next = self.motion.root_v[next_frames]
+            w_next = self.motion.root_w[next_frames]
+            p = torch.lerp(p, p_next, fraction.unsqueeze(-1))
+            v = torch.lerp(v, v_next, fraction.unsqueeze(-1))
+            w = torch.lerp(w, w_next, fraction.unsqueeze(-1))
+            q0, q1 = mat_to_quat(R), mat_to_quat(R_next)
+            R = quat_to_mat(quat_slerp(q0, q1, fraction))
+        origins = self.scene.env_origins if env_ids is None else self.scene.env_origins[env_ids]
+        pose = torch.cat((p + origins, mat_to_quat(R)), -1)
+        self.robot.write_root_link_pose_to_sim(pose, env_ids=env_ids)
+        self.robot.write_root_link_velocity_to_sim(torch.cat((v, w), -1), env_ids=env_ids)
 
     @property
     def num_envs(self) -> int:
@@ -440,18 +474,28 @@ class TrackingSim:
         xi = self.xi.clone()
         a_prev = self.a_prev.clone()
         ep_step = self.ep_step.clone()
+        if self.spec.kinematic_root:
+            self._write_reference_root(f)
+            self.sim.forward()
         target = self.default_q + xi[:, 1 : 1 + self.J] + self.alpha * a
         self.robot.set_joint_position_target(target)
+        clip_end = self.motion.clip_end[self.motion.clip_id[f]]
+        f1 = torch.minimum(f + 1, clip_end)
         for _ in range(DECIMATION):
             self.scene.write_data_to_sim()
             self.sim.step()
             self.scene.update(PHYSICS_DT)
+            if self.spec.kinematic_root:
+                substep = _ + 1
+                fraction = torch.full((self.N,), substep / DECIMATION, dtype=torch.float32, device=self.device)
+                self._write_reference_root(f, next_frames=f1, fraction=fraction)
             if self.pipe.stateful:
                 gyro, accel = self._imu_site() if self.spec.sensing.imu is not None else (None, None)
                 self._obs_state = self.pipe.filter_update(self._obs_state, self.robot.data.joint_vel, gyro, accel, self.xi,
                                                           PHYSICS_DT, noise=self.randomize)  # fmt: skip
+        if self.spec.kinematic_root:
+            self.sim.forward()
         S1 = self.state()
-        f1 = f + 1
         if self.object is not None:
             self._write_object_pose(f1, torch.arange(self.N, device=self.device))
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)

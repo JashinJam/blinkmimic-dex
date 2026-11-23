@@ -131,6 +131,7 @@ SPEC = RobotSpec(
     motion_glob="*.npz",
     load_motion=_load_npz,
     include_root_position_error=True,
+    kinematic_root=True,
     njmax=800,
     nconmax=256,
 )
