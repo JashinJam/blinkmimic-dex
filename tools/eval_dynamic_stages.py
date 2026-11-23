@@ -30,6 +30,8 @@ from blinkmimic.env import TrackingSim, make_sim
 from blinkmimic.kinematics import Kinematics
 from blinkmimic.mdp import MAX_STEP_REWARD, MDP
 from blinkmimic.motion import MotionLib
+from blinkmimic.networks import Policy, policy_kwargs
+import blinkmimic.networks as networks
 from blinkmimic.robot import get_robot
 
 
@@ -54,6 +56,7 @@ def main() -> None:
     parser.add_argument("--motion_dir", required=True)
     parser.add_argument("--object_mjcf", required=True)
     parser.add_argument("--output", type=Path, required=True, help="summary JSON path")
+    parser.add_argument("--checkpoint", default=None, help="optional frozen Actor checkpoint; default uses the privileged reference action")
     parser.add_argument("--hold_window", type=int, default=10)
     parser.add_argument("--hold_speed", type=float, default=0.25, help="m/s")
     parser.add_argument("--lift_delta", type=float, default=0.02, help="m above first-contact height")
@@ -75,6 +78,30 @@ def main() -> None:
         robot.sensing,
         include_root_position_error=robot.include_root_position_error,
     )
+    policy = None
+    policy_hist = None
+    policy_goal_frames = None
+    policy_controller = "privileged_next_frame_joint_reference"
+    if args.checkpoint:
+        checkpoint = torch.load(args.checkpoint, map_location=dev, weights_only=False)
+        ck_args = checkpoint["args"]
+        motion.set_causal_goal(ck_args.get("causal_goal", False))
+        policy_goal_frames = int(ck_args["goal_frames"])
+        hist_len = int(ck_args["hist"])
+        width = lambda key, default: tuple(int(x) for x in ck_args.get(key, default).split(","))  # noqa: E731
+        policy = Policy(
+            mdp.obs_dim,
+            motion.goal_dim(policy_goal_frames),
+            robot.num_joints,
+            hist=hist_len,
+            enc_hidden=width("enc_hidden", "2048,1024,512,256"),
+            dec_hidden=width("dec_hidden", "2048,1024,512,256"),
+            **policy_kwargs(ck_args, robot),
+        ).to(dev)
+        policy.load_state_dict(checkpoint["pi"])
+        policy.eval()
+        networks.AMP_DTYPE = torch.bfloat16 if ck_args.get("amp", "none") == "bf16" else None
+        policy_controller = "frozen_actor_checkpoint"
     clip_of = torch.arange(len(motion.names), device=dev)
     env = TrackingSim(
         make_sim(robot),
@@ -122,7 +149,12 @@ def main() -> None:
             alive = ~env.done_eval.clone()
             f = env.f.clone()
             f1 = torch.minimum(f + 1, clip_end)
-            action = (motion.q[f1] - env.default_q) / env.alpha
+            if policy is None:
+                action = (motion.q[f1] - env.default_q) / env.alpha
+            else:
+                obs = env.observe()
+                policy_hist = obs.unsqueeze(1).repeat(1, hist_len, 1) if policy_hist is None else torch.cat((policy_hist[:, 1:], obs.unsqueeze(1)), 1)
+                action = policy(policy_hist, motion.goal(env.f, policy_goal_frames))
             out = env.step(action)
             env.refresh()
             object_pos = env.object.data.root_link_pos_w - env.scene.env_origins
@@ -223,6 +255,8 @@ def main() -> None:
         "motion_dir": args.motion_dir,
         "object_mjcf": args.object_mjcf,
         "dynamic_object": True,
+        "controller": policy_controller,
+        "checkpoint": args.checkpoint,
         "contact_geom_ids": object_ids,
         "thresholds": {
             "hold_window_steps": args.hold_window,
