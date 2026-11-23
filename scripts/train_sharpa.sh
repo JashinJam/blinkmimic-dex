@@ -3,7 +3,7 @@
 # The object reference entity writes a mocap pose every step, so CUDA collection/reset graphs
 # are intentionally omitted. All algorithmic flags from PRESET[main] remain explicit here.
 # Usage: bash scripts/train_sharpa.sh <log_dir> [extra train.py flags]
-set -eu
+set -euo pipefail
 cd "$(dirname "$0")/.."
 LOG_DIR=${1:?usage: bash scripts/train_sharpa.sh <log_dir> [extra train.py flags]}; shift
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-4}
@@ -20,15 +20,12 @@ PYTHONPATH=src ${PYTHON:-uv run python} -u -m blinkmimic.train --log_dir "$LOG_D
   --wm_batches 5 \
   --wm_hidden 1024,1024,1024 \
   --fail_reset 0.3 \
-  --contact_reward 0.25 \
   --wm_structured \
-  --wm_mirror 0.5 \
   --pi_opt muon \
   --wm_opt muon \
   --pi_ref_skip \
   --wm_only_iters 0 \
   --bin_fix \
-  --ref_contact_fix \
   --pi_batch 2048 \
   --pi_lr_mult 4 \
   --lr_decay_ret 0.75 \
