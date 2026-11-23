@@ -21,6 +21,7 @@ if args.dynamic_object and args.object_rel_reward:
     raise ValueError("--object_rel_reward currently compares against the recorded object reference; leave it at 0 for dynamic smoke")
 
 import torch
+import numpy as np
 
 from blinkmimic.dr import XiLayout
 from blinkmimic.env import TrackingSim, make_sim
@@ -29,6 +30,17 @@ from blinkmimic.mdp import MDP, RewardCfg
 from blinkmimic.motion import MotionLib
 from blinkmimic.robot import get_robot
 from blinkmimic.rotations import quat_to_mat, rot_angle_sq
+
+
+def _object_contact_counts(env, object_geom_ids: list[int]) -> np.ndarray:
+    """Read per-world contacts involving the dynamic object's collision geoms."""
+    ncon = int(np.asarray(env.sim.data.nacon.numpy()).reshape(-1)[0])
+    if ncon <= 0:
+        return np.zeros(env.num_envs, dtype=np.int64)
+    geom = np.asarray(env.sim.data.contact.geom.numpy())[:ncon]
+    world = np.asarray(env.sim.data.contact.worldid.numpy())[:ncon]
+    mask = np.isin(geom[:, 0], object_geom_ids) | np.isin(geom[:, 1], object_geom_ids)
+    return np.bincount(world[mask], minlength=env.num_envs)
 
 dev = "cuda:0"
 robot = get_robot(args.robot)
@@ -96,9 +108,8 @@ for t in range(150):
         if args.dynamic_object:
             env.refresh()
             object_pos = env.object.data.root_link_pos_w - env.scene.env_origins
-            ncon = getattr(env.sim.data, "ncon", None)
-            if ncon is not None:
-                line += ("object_z", object_pos[:, 2].mean().item(), "contacts", ncon.float().mean().item())
-            else:
-                line += ("object_z", object_pos[:, 2].mean().item())
+            contact_counts = _object_contact_counts(env, object_ids)
+            line += ("object_z", object_pos[:, 2].mean().item(),
+                     "object_contacts", float(contact_counts.mean()),
+                     "worlds_with_object_contact", int(np.count_nonzero(contact_counts)))
         print(*line)
