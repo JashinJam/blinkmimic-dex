@@ -18,6 +18,7 @@ from mjlab.utils.lab_api.math import quat_apply_inverse
 from mjlab.scene import Scene, SceneCfg
 from mjlab.sim import MujocoCfg, Simulation, SimulationCfg
 from mjlab.terrains import TerrainEntityCfg
+from mjlab.utils.spec_config import CollisionCfg
 
 from .dr import DomainRandomizer, XiLayout
 from .mdp import MAX_STEP_REWARD, MDP, flatten_state
@@ -68,8 +69,25 @@ def _object_cfg(path: str) -> EntityCfg:
     )
 
 
-def make_scene_cfg(robot: RobotSpec, num_envs: int, object_mjcf: str | None = None) -> SceneCfg:
-    entities = {"robot": robot.robot_cfg()}
+def make_scene_cfg(robot: RobotSpec, num_envs: int, object_mjcf: str | None = None,
+                   dynamic_object: bool = False) -> SceneCfg:
+    if dynamic_object and object_mjcf is None:
+        raise ValueError("dynamic_object requires object_mjcf")
+    robot_cfg = robot.robot_cfg()
+    if dynamic_object:
+        # The Sharpa source keeps all collision geoms disabled for the tracking baseline.  For
+        # the dynamic-object branch, enable only named collision geoms and reserve a separate bit
+        # for object contacts.  Visual geoms and hand self-collisions remain disabled.
+        robot_cfg.collisions = (CollisionCfg(
+            geom_names_expr=(r"collision_.*",),
+            contype=1,
+            conaffinity=2,
+            condim=3,
+            priority=0,
+            friction=(1.0, 0.5, 0.005),
+            disable_other_geoms=False,
+        ),)
+    entities = {"robot": robot_cfg}
     if object_mjcf is not None:
         entities["object"] = _object_cfg(object_mjcf)
     return SceneCfg(
@@ -118,18 +136,22 @@ class TrackingSim:
     def __init__(self, sim_cfg: SimulationCfg, num_envs: int, robot: RobotSpec, motion: MotionLib, mdp: MDP,
                  device: str, gamma: float = 0.99, eval_mode: bool = False, max_episode_steps: int = 500,
                  reset_noise: bool = True, randomize: bool | None = None, fail_reset: float = 0.0, bin_fix: bool = False,
-                 object_mjcf: str | None = None):  # fmt: skip
+                 object_mjcf: str | None = None, dynamic_object: bool = False):  # fmt: skip
         """``randomize`` (default: not eval_mode) switches domain randomization, observation noise and
         delay, and pushes; ``eval_mode`` switches evaluation bookkeeping (no auto-reset, episode starts
         exactly on the reference)."""
         self.device = device
-        self.scene = Scene(make_scene_cfg(robot, num_envs, object_mjcf), device=device)
+        self.scene = Scene(make_scene_cfg(robot, num_envs, object_mjcf, dynamic_object), device=device)
         self.sim = Simulation(num_envs=num_envs, cfg=sim_cfg, model=self.scene.compile(), device=device)
         self.scene.initialize(mj_model=self.sim.mj_model, model=self.sim.model, data=self.sim.data)
         self.robot = self.scene["robot"]
         self.object = self.scene["object"] if object_mjcf is not None else None
-        if self.object is not None and not self.object.is_mocap:
-            raise ValueError("the reference object MJCF must be fixed-base so mjlab can drive its mocap pose")
+        self.dynamic_object = bool(dynamic_object)
+        if self.object is not None:
+            if self.dynamic_object and self.object.is_fixed_base:
+                raise ValueError("dynamic_object requires an object MJCF with a freejoint")
+            if not self.dynamic_object and not self.object.is_mocap:
+                raise ValueError("the reference object MJCF must be fixed-base mocap unless dynamic_object is set")
         if self.object is not None and motion.object_p is None:
             raise ValueError("object_mjcf requires motion files with object_pos/object_quat_wxyz")
         assert list(self.robot.joint_names) == list(robot.joint_names), self.robot.joint_names
@@ -196,7 +218,15 @@ class TrackingSim:
             return
         pose = torch.cat((self.motion.object_p[frames] + self.scene.env_origins[env_ids],
                           mat_to_quat(self.motion.object_R[frames])), -1)
-        self.object.write_mocap_pose_to_sim(pose, env_ids=env_ids)
+        if self.object.is_mocap:
+            self.object.write_mocap_pose_to_sim(pose, env_ids=env_ids)
+        elif self.dynamic_object:
+            # A dynamic object is initialized at the recorded pose and then left to physics.  The
+            # motion files do not yet carry object velocity, so the first dynamic smoke uses zero
+            # initial velocity and does not write the object again during step().
+            self.object.write_root_state_to_sim(
+                torch.cat((pose, torch.zeros(len(env_ids), 6, device=self.device)), -1), env_ids=env_ids
+            )
 
     def _write_reference_root(self, frames: torch.Tensor, env_ids: torch.Tensor | None = None,
                               next_frames: torch.Tensor | None = None, fraction: torch.Tensor | None = None) -> None:
@@ -495,7 +525,7 @@ class TrackingSim:
         if self.spec.kinematic_root:
             self.sim.forward()
         S1 = self.state()
-        if self.object is not None:
+        if self.object is not None and self.object.is_mocap:
             self._write_object_pose(f1, torch.arange(self.N, device=self.device))
         r, terms = self.mdp.reward(S1, f1, a, a_prev, terms=True)
         term = self.mdp.termination(S1, f1)

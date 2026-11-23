@@ -27,7 +27,9 @@ parser.add_argument("--watch", action="store_true")
 parser.add_argument("--ckpt", type=str, default=None, help="evaluate one checkpoint")
 parser.add_argument("--record", type=str, default=None, help="save trajectories (npz) for rendering")
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
-parser.add_argument("--object_mjcf", type=str, default=None, help="optional fixed-base reference object MJCF")
+parser.add_argument("--object_mjcf", type=str, default=None, help="optional reference or dynamic object MJCF")
+parser.add_argument("--dynamic_object", action="store_true",
+                    help="use a free-root collidable object and leave it to physics after reset")
 parser.add_argument("--every", type=int, default=1, help="evaluate every n-th checkpoint")
 parser.add_argument("--dr_from", type=str, default=None, help="evaluate under this robot's training randomization ('self': own)")
 parser.add_argument("--dr_parts", type=str, default="all", choices=["all", "dynamics", "sensing"],
@@ -35,6 +37,9 @@ parser.add_argument("--dr_parts", type=str, default="all", choices=["all", "dyna
 parser.add_argument("--repeats", type=int, default=1, help="rollouts per clip")
 parser.add_argument("--seed", type=int, default=0)
 args = parser.parse_args()
+
+if args.dynamic_object and not args.object_mjcf:
+    raise ValueError("--dynamic_object requires --object_mjcf")
 
 import dataclasses
 import re
@@ -148,7 +153,7 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
 
 sim_cfg = make_sim(robot)
 env = TrackingSim(sim_cfg, N, robot, motion, mdp, dev, eval_mode=True, randomize=args.dr_from is not None,
-                  object_mjcf=args.object_mjcf)
+                  object_mjcf=args.object_mjcf, dynamic_object=args.dynamic_object)
 if args.ckpt:
     ck = torch.load(args.ckpt, map_location=dev)
     res = evaluate(env, ck, args.record)

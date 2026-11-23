@@ -128,7 +128,9 @@ parser.add_argument("--max_hours", type=float, default=None, help="stop after th
 parser.add_argument("--log_every", type=int, default=50)
 parser.add_argument("--motion_dir", type=str, default=None, help="defaults to the robot's motion directory")
 parser.add_argument("--object_mjcf", type=str, default=None,
-                    help="fixed-base mocap object MJCF for the reference scene (requires object metadata in NPZ motions)")
+                    help="reference or dynamic object MJCF (requires object metadata in NPZ motions)")
+parser.add_argument("--dynamic_object", action="store_true",
+                    help="use a free-root collidable object and leave it to physics after reset")
 parser.add_argument("--object_rel_reward", type=float, default=0.0,
                     help="dense hand-object relative-position reward weight used only during training")
 parser.add_argument("--object_rel_std", type=float, default=0.05,
@@ -138,6 +140,11 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 args = parser.parse_args()
+
+if args.dynamic_object and not args.object_mjcf:
+    raise ValueError("--dynamic_object requires --object_mjcf")
+if args.dynamic_object and args.object_rel_reward:
+    raise ValueError("--object_rel_reward currently compares against the recorded object reference; leave it at 0 for dynamic runs")
 
 import torch
 import torch.nn as nn
@@ -546,7 +553,7 @@ if args.compile_more:
 if args.object_mjcf and (args.collect_graph or args.reset_masked):
     raise ValueError("--object_mjcf currently requires eager collection and eager resets")
 env = TrackingSim(sim_cfg, args.num_envs, robot, motion, mdp, dev, gamma=args.gamma, fail_reset=args.fail_reset,
-                  bin_fix=args.bin_fix, object_mjcf=args.object_mjcf)
+                  bin_fix=args.bin_fix, object_mjcf=args.object_mjcf, dynamic_object=args.dynamic_object)
 if INIT_BINS is not None:  # --resume: the checkpoint's reset-sampler statistics (episodes already running keep their start)
     env.bin_G.copy_(INIT_BINS["bin_G"]), env.bin_fail.copy_(INIT_BINS["bin_fail"]), env.bin_w_avg.copy_(INIT_BINS["bin_w_avg"])
 buffer = ReplayBuffer(args.buffer_steps, args.num_envs, dev, J, layout.dim,
@@ -701,7 +708,7 @@ if EPROBE:
     EP_PI = copy.deepcopy(pi_avg.module) if args.eprobe_async else pi_avg.module  # sweep policy (async: a snapshot)
     EP_SIDE, EP_ASYNC, ITER_NOW = (torch.cuda.Stream() if args.eprobe_async else None), {}, [0]
     penv = TrackingSim(make_sim(robot), P_EP, robot, motion, mdp, dev, eval_mode=True, randomize=False, reset_noise=False,
-                       object_mjcf=args.object_mjcf)
+                       object_mjcf=args.object_mjcf, dynamic_object=args.dynamic_object)
     EP_FAIL = torch.zeros(motion.num_bins, device=dev)  # decayed counts of first failures per bin
     # bin b -> the next bin of the same clip (or itself at the clip end): walking it --eprobe_win times spreads a failure
     # weight back over the window before it

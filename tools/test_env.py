@@ -8,12 +8,17 @@ parser.add_argument("--robot", type=str, default="g1")
 parser.add_argument("--motion_dir", type=str, default=None)
 parser.add_argument("--num_envs", type=int, default=64)
 parser.add_argument("--causal_goal", action="store_true", help="use the current-frame causal goal path")
-parser.add_argument("--object_mjcf", type=str, default=None, help="fixed-base mocap reference object MJCF")
+parser.add_argument("--object_mjcf", type=str, default=None, help="reference or dynamic object MJCF")
+parser.add_argument("--dynamic_object", action="store_true",
+                    help="treat object_mjcf as a free-root collidable object and leave it to physics after reset")
 parser.add_argument("--object_rel_reward", type=float, default=0.0,
                     help="optional dense hand-object relative-position reward weight")
 parser.add_argument("--object_rel_std", type=float, default=0.05,
                     help="standard deviation used by the hand-object relative-position reward")
 args = parser.parse_args()
+
+if args.dynamic_object and args.object_rel_reward:
+    raise ValueError("--object_rel_reward currently compares against the recorded object reference; leave it at 0 for dynamic smoke")
 
 import torch
 
@@ -35,19 +40,29 @@ reward_cfg = RewardCfg(w_object_rel=args.object_rel_reward, object_rel_std=args.
 mdp = MDP(kin, motion, torch.tensor(robot.default_joint_pos_list(), device=dev), XiLayout(robot, dev).dim, robot.sensing,
           cfg=reward_cfg, include_root_position_error=robot.include_root_position_error)
 env = TrackingSim(make_sim(robot), args.num_envs, robot, motion, mdp, dev, eval_mode=True,
-                  object_mjcf=args.object_mjcf)
+                  object_mjcf=args.object_mjcf, dynamic_object=args.dynamic_object)
 frames = motion.clip_start[torch.arange(args.num_envs, device=dev) % len(motion.names)] + 100
 if args.object_mjcf:
     if motion.object_p is None:
         raise ValueError("--object_mjcf requires motion files with object_pos/object_quat_wxyz")
-    mocap_id = env.object.indexing.mocap_id
-    if mocap_id is None:
-        raise ValueError("--object_mjcf did not create a mocap entity")
-    print(f"object: mocap={env.object.is_mocap} fixed_base={env.object.is_fixed_base} path={args.object_mjcf}")
+    print(f"object: mocap={env.object.is_mocap} fixed_base={env.object.is_fixed_base} dynamic={args.dynamic_object} path={args.object_mjcf}")
+    if args.dynamic_object:
+        model = env.sim.mj_model
+        robot_ids = [i for i in range(model.ngeom) if (model.geom(i).name or "").startswith("robot/collision_")]
+        object_ids = [i for i in range(model.ngeom) if (model.geom(i).name or "").startswith("object/object_collision_")]
+        print("dynamic collision geoms:", "robot", len(robot_ids), "object", len(object_ids),
+              "robot contype", sorted({int(model.geom_contype[i]) for i in robot_ids}),
+              "robot conaffinity", sorted({int(model.geom_conaffinity[i]) for i in robot_ids}),
+              "object contype", sorted({int(model.geom_contype[i]) for i in object_ids}),
+              "object conaffinity", sorted({int(model.geom_conaffinity[i]) for i in object_ids}))
 env.reset(torch.arange(args.num_envs, device=dev), frames)
 env.refresh()
 if args.object_mjcf:
-    object_pos = env.sim.data.mocap_pos[:, mocap_id] - env.scene.env_origins
+    if env.object.is_mocap:
+        mocap_id = env.object.indexing.mocap_id
+        object_pos = env.sim.data.mocap_pos[:, mocap_id] - env.scene.env_origins
+    else:
+        object_pos = env.object.data.root_link_pos_w - env.scene.env_origins
     object_pos_error = (object_pos - motion.object_p[frames]).abs().max().item()
     print(f"object reset position max error: {object_pos_error:.3e} m")
 S = env.state()
@@ -78,4 +93,12 @@ for t in range(150):
                 "e_body_pos", out["terms"]["e_body_pos"].mean().item())
         if "object_rel" in out["terms"]:
             line += ("e_object_rel", out["terms"]["object_rel"].mean().item())
+        if args.dynamic_object:
+            env.refresh()
+            object_pos = env.object.data.root_link_pos_w - env.scene.env_origins
+            ncon = getattr(env.sim.data, "ncon", None)
+            if ncon is not None:
+                line += ("object_z", object_pos[:, 2].mean().item(), "contacts", ncon.float().mean().item())
+            else:
+                line += ("object_z", object_pos[:, 2].mean().item())
         print(*line)

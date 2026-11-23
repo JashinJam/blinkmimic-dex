@@ -22,8 +22,13 @@ parser.add_argument("--group", type=int, default=13, help="checkpoints evaluated
 parser.add_argument("--reps", type=int, default=1,
                     help="independent replicas of every clip per checkpoint (the simulator is not bitwise "
                          "reproducible, so borderline clips can flip); results are averaged and written to eval_r<reps>.csv")
-parser.add_argument("--object_mjcf", type=str, default=None, help="optional fixed-base reference object MJCF")
+parser.add_argument("--object_mjcf", type=str, default=None, help="optional reference or dynamic object MJCF")
+parser.add_argument("--dynamic_object", action="store_true",
+                    help="use a free-root collidable object and leave it to physics after reset")
 args = parser.parse_args()
+
+if args.dynamic_object and not args.object_mjcf:
+    raise ValueError("--dynamic_object requires --object_mjcf")
 
 import torch
 
@@ -142,7 +147,7 @@ for s in range(0, len(todo), args.group):
     cks = [torch.load(p, map_location="cpu", weights_only=False) for p in paths]  # full checkpoints also hold the world model: keep them off the GPU
     if env is None or env.N != C * len(paths) * args.reps:
         env = TrackingSim(make_sim(robot), C * len(paths) * args.reps, robot, motion, mdp, dev, eval_mode=True,
-                          randomize=False, object_mjcf=args.object_mjcf)
+                          randomize=False, object_mjcf=args.object_mjcf, dynamic_object=args.dynamic_object)
     t0 = time.time()
     for p, ck, res in zip(paths, cks, merge_reps(evaluate_group(env, [c for c in cks for _ in range(args.reps)]))):
         it = int(os.path.basename(p)[5:11])
