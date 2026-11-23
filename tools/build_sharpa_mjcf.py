@@ -98,7 +98,11 @@ def build(source: Path, output: Path) -> None:
     new_root.set("name", "sharpa_root")
     new_root.set("pos", _fmt(position))
     new_root.set("quat", _fmt(orientation))
-    new_root.set("gravcomp", target.get("gravcomp", "0"))
+    # The source asset assumes a robot arm supports the hand.  This branch models
+    # the wrist root as the externally commanded hand pose, so every hand body
+    # receives full gravity compensation instead of the source 0.8 approximation.
+    for body in new_root.iter("body"):
+        body.set("gravcomp", "1.0")
     new_root.attrib.pop("class", None)
     new_root.attrib.pop("mocap", None)
     new_root.set("pos", _fmt(position))
