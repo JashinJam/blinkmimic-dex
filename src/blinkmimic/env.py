@@ -196,7 +196,7 @@ class TrackingSim:
             return
         pose = torch.cat((self.motion.object_p[frames] + self.scene.env_origins[env_ids],
                           mat_to_quat(self.motion.object_R[frames])), -1)
-        self.object.write_mocap_pose(pose, env_ids=env_ids)
+        self.object.write_mocap_pose_to_sim(pose, env_ids=env_ids)
 
     @property
     def num_envs(self) -> int:
