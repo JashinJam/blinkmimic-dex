@@ -34,11 +34,11 @@ from blinkmimic.rotations import quat_to_mat, rot_angle_sq
 
 def _object_contact_counts(env, object_geom_ids: list[int]) -> np.ndarray:
     """Read per-world contacts involving the dynamic object's collision geoms."""
-    ncon = int(np.asarray(env.sim.data.nacon.numpy()).reshape(-1)[0])
+    ncon = int(env.sim.data.nacon.detach().cpu().item())
     if ncon <= 0:
         return np.zeros(env.num_envs, dtype=np.int64)
-    geom = np.asarray(env.sim.data.contact.geom.numpy())[:ncon]
-    world = np.asarray(env.sim.data.contact.worldid.numpy())[:ncon]
+    geom = env.sim.data.contact.geom.detach().cpu().numpy()[:ncon]
+    world = env.sim.data.contact.worldid.detach().cpu().numpy()[:ncon]
     mask = np.isin(geom[:, 0], object_geom_ids) | np.isin(geom[:, 1], object_geom_ids)
     return np.bincount(world[mask], minlength=env.num_envs)
 
